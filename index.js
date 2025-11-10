@@ -2,167 +2,184 @@ import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
 
-// ======== Firebase Initialization ========
+// ===================================================================
+// ✅ ENV + FIREBASE INITIALIZATION
+// ===================================================================
 let serviceAccount;
 
 try {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT);
+  console.log("✅ Firebase credentials loaded");
 } catch (error) {
   console.error("❌ Failed to parse SERVICE_ACCOUNT JSON:", error);
 }
 
 if (!serviceAccount) {
-  console.error("❌ Missing Firebase credentials. Check Render Environment Variables.");
+  console.error("❌ Missing Firebase credentials.");
 }
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+  credential: admin.credential.cert(serviceAccount)
 });
 
 const db = admin.firestore();
-
-// ======== Express App Setup ========
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.API_KEY || "ESP_SHARED_KEY_123";
+const API_KEY = process.env.API_KEY || "TEST_KEY";
 
-// ======== ROUTES ========
-
-// Health check
+// ===================================================================
+// ✅ TEST ROUTE
+// ===================================================================
 app.get("/", (req, res) => {
-  res.send("✅ Server running with RFID + App endpoints");
+  res.send("✅ Seenzone Server Running");
 });
 
 // ===================================================================
-// ✅ 1. APP LOGIN (name + rfid acts as password)
+// ✅ LOGIN ROUTE (NFC auto login with UID normalization)
 // ===================================================================
 app.post("/login", async (req, res) => {
   try {
-    const { name, rfid_uid } = req.body;
+    let { rfid_uid } = req.body;
 
-    if (!name || !rfid_uid) {
-      return res.status(400).json({ message: "Missing name or RFID" });
+    if (!rfid_uid) {
+      return res.status(400).json({ message: "Missing RFID UID" });
     }
 
-    const usersRef = db.collection("users");
-    const snapshot = await usersRef
-      .where("name", "==", name)
+    // Normalize ALL UID formats to AA:BB:CC:DD
+    rfid_uid = rfid_uid
+      .replace(/[^a-fA-F0-9]/g, "")
+      .toUpperCase()
+      .match(/.{1,2}/g)
+      .join(":");
+
+    console.log("✅ Normalized UID:", rfid_uid);
+
+    const snap = await db.collection("users")
       .where("rfid_uid", "==", rfid_uid)
+      .limit(1)
       .get();
 
-    if (snapshot.empty) {
-      return res.status(404).json({ message: "Invalid login" });
+    if (snap.empty) {
+      return res.status(404).json({ message: "User not found" });
     }
 
-    const user = snapshot.docs[0];
-    const userData = user.data();
+    const userDoc = snap.docs[0];
+    const data = userDoc.data();
 
     return res.status(200).json({
-      userId: user.id,
-      name: userData.name,
-      balance: userData.balance,
+      userId: userDoc.id,
+      name: data.name,
+      balance: data.balance,
+      rfid_uid: data.rfid_uid
     });
-  } catch (error) {
-    console.error("❌ Login error:", error);
-    return res.status(500).json({ message: "Server error" });
+
+  } catch (err) {
+    console.error("Login Error:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
 // ===================================================================
-// ✅ 2. PRODUCT LOOKUP BY BARCODE
+// ✅ 1. GET USER DETAILS
 // ===================================================================
-app.get("/product/:barcode", async (req, res) => {
+app.get("/user/:rfid_uid", async (req, res) => {
   try {
-    const barcode = req.params.barcode;
+    const { rfid_uid } = req.params;
 
-    const productsRef = db.collection("products");
-    const snapshot = await productsRef.where("barcode", "==", barcode).get();
+    const snap = await db.collection("users")
+      .where("rfid_uid", "==", rfid_uid)
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
 
-    if (snapshot.empty) {
-      return res.status(404).json({ message: "Product not found" });
+    if (snap.empty) {
+      return res.status(404).json({ message: "User not found" });
     }
 
-    const product = snapshot.docs[0].data();
-
-    return res.status(200).json(product);
-  } catch (error) {
-    console.error("❌ Product lookup error:", error);
-    return res.status(500).json({ message: "Server error" });
+    return res.status(200).json(snap.docs[0].data());
+  } catch (err) {
+    console.error("User Fetch Error:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
 // ===================================================================
-// ✅ 3. NEW CHECKOUT ROUTE (Stores Pending Transactions)
+// ✅ 2. ADD PENDING ITEM
 // ===================================================================
-app.post("/checkout", async (req, res) => {
+app.post("/addPending", async (req, res) => {
   try {
-    const { userId, cartItems, rfid_uid } = req.body;
+    const { rfid_uid, items, total } = req.body;
 
-    if (!userId || !cartItems || !rfid_uid) {
-      return res.status(400).json({ message: "Missing userId, cartItems, or rfid_uid" });
+    if (!rfid_uid || !items || !total) {
+      return res.status(400).json({ message: "Missing fields" });
     }
 
-    if (!Array.isArray(cartItems) || cartItems.length === 0) {
-      return res.status(400).json({ message: "cartItems must be a non-empty array" });
-    }
-
-    let total = 0;
-
-    // Sum total price from the provided cart items
-    cartItems.forEach(item => {
-      total += (item.price || 0) * (item.qty || 1);
-    });
-
-    const pendingRef = db.collection("pending_transactions");
-
-    await pendingRef.add({
-      userId,
+    await db.collection("pending_transactions").add({
       rfid_uid,
-      items: cartItems,
+      items,
       total,
       status: "pending",
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    return res.status(200).json({
-      message: "Checkout sent to pending. Please scan RFID to complete payment.",
-      total
-    });
-
-  } catch (error) {
-    console.error("❌ New Checkout Error:", error);
-    return res.status(500).json({ message: "Server error" });
+    res.status(200).json({ message: "Pending added" });
+  } catch (err) {
+    console.error("Add Pending Error:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
 // ===================================================================
-// ✅ 4. OPTIONAL DEBUG: View pending transactions
+// ✅ 3. CLEAR PENDING
 // ===================================================================
-app.get("/pendingTest", async (req, res) => {
+app.delete("/clearPending/:rfid_uid", async (req, res) => {
   try {
-    const rfid = req.query.rfid;
-    if (!rfid) return res.status(400).json({ message: "Missing rfid query" });
+    const { rfid_uid } = req.params;
 
-    const snaps = await db.collection("pending_transactions")
-      .where("rfid_uid", "==", rfid)
+    const snap = await db.collection("pending_transactions")
+      .where("rfid_uid", "==", rfid_uid)
       .where("status", "==", "pending")
-      .orderBy("createdAt", "asc")
       .get();
 
-    const list = snaps.docs.map(d => ({ id: d.id, ...d.data() }));
+    const batch = db.batch();
+    snap.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
 
-    return res.json({ pending: list });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ message: "err", error: e.message });
+    res.status(200).json({ message: "Pending cleared" });
+  } catch (err) {
+    console.error("Clear Pending Error:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
 // ===================================================================
-// ✅ 5. ESP8266 RFID PAYMENT PROCESSING (Atomic Transaction)
+// ✅ 4. ANDROID RFID SCAN CONFIRMATION
+// ===================================================================
+app.post("/rfidScan", async (req, res) => {
+  try {
+    const { rfid_uid } = req.body;
+
+    if (!rfid_uid) return res.status(400).json({ message: "Missing RFID UID" });
+
+    await db.collection("pending_rfid")
+      .doc("current")
+      .set({
+        rfid_uid,
+        status: "scanned",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    res.status(200).json({ message: "RFID Recorded" });
+  } catch (err) {
+    console.error("RFID Scan Error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ===================================================================
+// ✅ 5. ESP8266 TRANSACTION PROCESSING
 // ===================================================================
 app.post("/transaction", async (req, res) => {
   try {
@@ -172,9 +189,16 @@ app.post("/transaction", async (req, res) => {
     const { rfid_uid } = req.body;
     if (!rfid_uid) return res.status(400).json({ message: "Missing RFID UID" });
 
-    console.log("Received RFID UID:", rfid_uid);
+    console.log("✅ Received RFID UID:", rfid_uid);
 
-    // Find user
+    await db.collection("pending_rfid")
+      .doc("current")
+      .set({
+        rfid_uid,
+        status: "scanned",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
     const userSnap = await db.collection("users")
       .where("rfid_uid", "==", rfid_uid)
       .limit(1)
@@ -187,31 +211,34 @@ app.post("/transaction", async (req, res) => {
     const userDoc = userSnap.docs[0];
     const userRef = userDoc.ref;
 
-    // Load pending transactions
     const pendingSnap = await db.collection("pending_transactions")
       .where("rfid_uid", "==", rfid_uid)
       .where("status", "==", "pending")
       .orderBy("createdAt", "asc")
-      .limit(10)
       .get();
 
     if (pendingSnap.empty) {
       return res.status(404).json({ message: "No pending transactions" });
     }
 
-    // Sum totals
     let totalAmount = 0;
-    const pendingDocs = [];
+    const allItems = [];
 
-    for (const doc of pendingSnap.docs) {
+    pendingSnap.forEach(doc => {
       const data = doc.data();
-      const docTotal = data.total || 0;
+      totalAmount += data.total || 0;
 
-      totalAmount += docTotal;
-      pendingDocs.push({ id: doc.id, ref: doc.ref, data, docTotal });
-    }
+      data.items.forEach(item => {
+        allItems.push({
+          name: item.name,
+          barcode: item.barcode,
+          price: item.price,
+          qty: item.qty || 1,
+          subtotal: (item.price || 0) * (item.qty || 1)
+        });
+      });
+    });
 
-    // Atomic Firestore Transaction
     await db.runTransaction(async (tx) => {
       const freshUser = await tx.get(userRef);
       const currentBalance = freshUser.get("balance") || 0;
@@ -224,43 +251,50 @@ app.post("/transaction", async (req, res) => {
 
       tx.update(userRef, { balance: newBalance });
 
-      // Log single transaction
       const transRef = db.collection("transactions").doc();
       tx.set(transRef, {
         userId: userRef.id,
+        name: userDoc.data().name,
         rfid_uid,
-        amount: totalAmount,
-        items: pendingDocs.map(p => ({
-          pendingDocId: p.id,
-          items: p.data.items,
-          total: p.docTotal
-        })),
+        totalAmount,
+        items: allItems,
+        itemCount: allItems.length,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         status: "completed"
       });
 
-      // Mark pending as completed
-      for (const p of pendingDocs) {
-        tx.update(p.ref, {
+      pendingSnap.forEach(doc => {
+        tx.update(doc.ref, {
           status: "completed",
           processedAt: admin.firestore.FieldValue.serverTimestamp(),
           transactionId: transRef.id
         });
-      }
+      });
     });
+
+    await db.collection("pending_rfid")
+      .doc("current")
+      .set({
+        rfid_uid,
+        status: "completed",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
 
     return res.status(200).json({ message: "Transaction Success" });
 
   } catch (err) {
     console.error("RFID Transaction Error:", err);
+
     if (err.message.includes("Insufficient balance")) {
       return res.status(400).json({ message: "Insufficient balance" });
     }
-    return res.status(500).json({ message: "Server error", error: err.message });
+
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
-// ======== Start Server ========
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+// ===================================================================
+// ✅ START SERVER
+// ===================================================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
